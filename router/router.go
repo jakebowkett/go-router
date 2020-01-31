@@ -7,8 +7,31 @@ import (
 	"time"
 )
 
-type Handler = func(reqId string, w http.ResponseWriter, r *http.Request, vars Vars)
-type Deferred = func(reqId string, duration int, r *http.Request)
+var methods = []string{
+	"HEAD",
+	"GET",
+	"POST",
+	"PUT",
+	"PATCH",
+	"DELETE",
+	"CONNECT",
+	"OPTIONS",
+	"TRACE",
+}
+
+type Request = struct {
+	Id      string
+	Request *http.Request
+	Vars    Vars
+	User    interface{}
+	Status  int
+	Error   error
+}
+
+type Handler = func(w http.ResponseWriter, r *Request)
+type Deferred = func(reqId string, r *http.Request, d time.Duration)
+type Recover = func(w http.ResponseWriter, reqId string, recovered interface{})
+type Middleware = func(r *Request) (status int, err error)
 
 type segment struct {
 	raw     string
@@ -18,15 +41,23 @@ type segment struct {
 
 type Vars = map[string]string
 
+type stratum struct {
+	method     string
+	pattern    []segment
+	handler    Handler
+	middleware []Middleware
+	call       Middleware
+}
+
 type Router struct {
-	methods       []string
-	patterns      [][]segment
-	handlers      []Handler
-	NotFound      Handler
-	Errors        []error
-	BeforeHandler func(reqId string)
-	IdGenerator   func() (id string)
-	Deferred      Deferred
+	strata      []stratum
+	Error       Handler
+	Errors      []error
+	Redirect    func(w http.ResponseWriter, r *Request) bool
+	Before      func(w http.ResponseWriter, r *http.Request)
+	IdGenerator func() (id string)
+	Deferred    Deferred
+	Recover     Recover
 }
 
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,61 +70,180 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqId = rt.IdGenerator()
 	}
 
-	if rt.BeforeHandler != nil {
-		rt.BeforeHandler(reqId)
+	if rt.Deferred != nil {
+		defer rt.Deferred(reqId, r, time.Since(start))
 	}
 
-	if rt.Deferred != nil {
-		defer rt.Deferred(reqId, int(time.Since(start).Nanoseconds()), r)
+	/*
+		This is after the first deferred call because they're
+		executed in reverse order. We need to call w.WriteHeader
+		before calling log.End. The call to log.BadRequest in
+	*/
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if rt.Recover == nil {
+				return
+			}
+			rt.Recover(w, reqId, recovered)
+		}
+	}()
+
+	request := &Request{
+		Id:      reqId,
+		Request: r,
+		Vars:    make(Vars),
 	}
+
+	if rt.Redirect != nil && rt.Redirect(w, request) {
+		return
+	}
+	if rt.Before != nil {
+		rt.Before(w, r)
+	}
+
+	var statusCode int
+	var seenRoute bool
 
 	reqPath := explodePath(r.URL.Path)
 
-	for i := range rt.patterns {
-		if rt.methods[i] != r.Method {
+	for _, s := range rt.strata {
+
+		if s.call != nil {
+			if code, err := s.call(request); err != nil {
+				request.Error = err
+				statusCode = code
+				seenRoute = true
+				break
+			}
 			continue
 		}
-		vars, ok := pathsMatch(rt.patterns[i], reqPath)
+
+		if s.method != r.Method {
+			continue
+		}
+
+		vars, ok := pathsMatch(s.pattern, reqPath)
 		if !ok {
 			continue
 		}
-		rt.handlers[i](reqId, w, r, vars)
-		return
-	}
+		seenRoute = true
 
-	if rt.NotFound != nil {
-		rt.NotFound(reqId, w, r, make(Vars))
-		return
-	}
-
-	w.WriteHeader(http.StatusNotFound)
-}
-
-func (rt *Router) Get(pattern string, handler Handler) {
-	rt.add("GET", pattern, handler)
-}
-
-func (rt *Router) Post(pattern string, handler Handler) {
-	rt.add("POST", pattern, handler)
-}
-
-func (rt *Router) add(method, pattern string, handler Handler) {
-	rt.methods = append(rt.methods, method)
-	rt.patterns = append(rt.patterns, rt.expandPattern(pattern))
-	rt.handlers = append(rt.handlers, handler)
-}
-
-func illegalChar(pattern, kind, chars string) error {
-	var s string
-	cc := strings.Split(chars, "")
-	for i, c := range cc {
-		if i == len(cc)-1 {
-			s += fmt.Sprintf(" or %q", c)
-			break
+		for _, mw := range s.middleware {
+			if code, err := mw(request); err != nil {
+				request.Error = err
+				statusCode = code
+				break
+			}
 		}
-		s += fmt.Sprintf("%q,", c)
+
+		request.Vars = vars
+		s.handler(w, request)
+
+		return
 	}
-	return fmt.Errorf("pattern segment %s cannot contain %s\npattern: %q", kind, s, pattern)
+
+	if !seenRoute {
+		statusCode = 404
+	}
+
+	if rt.Error != nil {
+		request.Status = statusCode
+		rt.Error(w, request)
+		return
+	}
+
+	// if statusCode >= 300 && statusCode < 400 {
+	// 	return
+	// }
+	w.WriteHeader(statusCode)
+}
+
+func (rt *Router) Use(fn Middleware) {
+	if fn == nil {
+		rt.Errors = append(rt.Errors, fmt.Errorf(
+			"route %d: function supplied to Use is nil",
+			len(rt.strata),
+		))
+	}
+	rt.strata = append(rt.strata, stratum{call: fn})
+}
+
+func (rt *Router) Get(pattern string, handler Handler, middleware ...Middleware) {
+	rt.Add("GET", pattern, handler, middleware...)
+}
+func (rt *Router) Pst(pattern string, handler Handler, middleware ...Middleware) {
+	rt.Add("POST", pattern, handler, middleware...)
+}
+func (rt *Router) Put(pattern string, handler Handler, middleware ...Middleware) {
+	rt.Add("PUT", pattern, handler, middleware...)
+}
+func (rt *Router) Pat(pattern string, handler Handler, middleware ...Middleware) {
+	rt.Add("PATCH", pattern, handler, middleware...)
+}
+func (rt *Router) Del(pattern string, handler Handler, middleware ...Middleware) {
+	rt.Add("DELETE", pattern, handler, middleware...)
+}
+func (rt *Router) Add(method, pattern string, handler Handler, middleware ...Middleware) {
+
+	stratIdx := len(rt.strata)
+
+	if !in(methods, method) {
+		rt.Errors = append(rt.Errors, fmt.Errorf(
+			`route %d: invalid HTTP method "%s" for pattern %s`,
+			stratIdx,
+			method,
+			pattern,
+		))
+	}
+
+	if handler == nil {
+		rt.Errors = append(rt.Errors, fmt.Errorf(
+			"route %d: no handler function supplied for %s %s",
+			stratIdx,
+			method,
+			pattern,
+		))
+	}
+
+	for i, mw := range middleware {
+		if mw == nil {
+			rt.Errors = append(rt.Errors, fmt.Errorf(
+				"route %d: middleware at index %d for %s %s is nil",
+				stratIdx,
+				i,
+				method,
+				pattern,
+			))
+		}
+	}
+
+	if !rt.isUnique(method, pattern) {
+		rt.Errors = append(rt.Errors, fmt.Errorf(
+			"route %d: unreachable route due to duplicate method and pattern pairing: %s %s",
+			stratIdx,
+			method,
+			pattern,
+		))
+	}
+
+	rt.strata = append(rt.strata, stratum{
+		method:     method,
+		pattern:    rt.expandPattern(pattern),
+		handler:    handler,
+		middleware: middleware,
+	})
+}
+
+func (rt *Router) isUnique(method, pattern string) bool {
+	unique := true
+	for _, s := range rt.strata {
+		_, ok := pathsMatch(s.pattern, explodePath(pattern))
+		if s.method != method || !ok {
+			continue
+		}
+		unique = false
+	}
+	return unique
 }
 
 func (rt *Router) expandPattern(pattern string) []segment {
@@ -166,6 +316,19 @@ func (rt *Router) expandPattern(pattern string) []segment {
 	}
 
 	return segments
+}
+
+func illegalChar(pattern, kind, chars string) error {
+	var s string
+	cc := strings.Split(chars, "")
+	for i, c := range cc {
+		if i == len(cc)-1 {
+			s += fmt.Sprintf(" or %q", c)
+			break
+		}
+		s += fmt.Sprintf("%q,", c)
+	}
+	return fmt.Errorf("pattern segment %s cannot contain %s\npattern: %q", kind, s, pattern)
 }
 
 func pathsMatch(pattern []segment, reqPath []string) (vars Vars, ok bool) {

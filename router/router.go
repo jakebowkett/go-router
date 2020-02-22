@@ -29,7 +29,7 @@ type Request = struct {
 }
 
 type Handler = func(w http.ResponseWriter, r *Request)
-type Deferred = func(reqId string, r *http.Request, d time.Duration)
+type Deferred = func(reqId string, r *http.Request, d time.Time)
 type Recover = func(w http.ResponseWriter, reqId string, recovered interface{})
 type Middleware = func(r *Request) (status int, err error)
 
@@ -71,7 +71,8 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if rt.Deferred != nil {
-		defer rt.Deferred(reqId, r, time.Since(start))
+		// defer rt.Deferred(reqId, r, time.Since(start))
+		defer rt.Deferred(reqId, r, start)
 	}
 
 	/*

@@ -357,7 +357,7 @@ func pathsMatch(pattern []segment, reqPath []string) (vars Vars, ok bool) {
 				negation symbol (^) the paths are
 				considered not to match.
 			*/
-			if match[0:1] == "^" {
+			if strings.HasPrefix(match, "^") {
 				if match[1:] == reqPath[i] {
 					return nil, false
 				}

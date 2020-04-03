@@ -71,7 +71,6 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if rt.Deferred != nil {
-		// defer rt.Deferred(reqId, r, time.Since(start))
 		defer rt.Deferred(reqId, r, start)
 	}
 
@@ -350,7 +349,26 @@ func pathsMatch(pattern []segment, reqPath []string) (vars Vars, ok bool) {
 			continue
 		}
 
-		if !in(seg.matches, reqPath[i]) {
+		found := false
+		for _, match := range seg.matches {
+			/*
+				If the current path segment matches
+				a segment pattern beginning with a
+				negation symbol (^) the paths are
+				considered not to match.
+			*/
+			if match[0:1] == "^" {
+				if match[1:] == reqPath[i] {
+					return nil, false
+				}
+			} else {
+				if match == reqPath[i] {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
 			return nil, false
 		}
 

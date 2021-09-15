@@ -1,3 +1,59 @@
+/*
+Package router is a simple HTTP router.
+
+It allows adding routes according to HTTP verbs (GET, POST, PUT, etc).
+Patterns supplied may have segments that use variable names which can
+serve as wildcards or they can specify a list of acceptable segments.
+
+	rt := router.New(router.Options{})
+
+	// Literal routes.
+	rt.Get("/about", handler.Page)
+	rt.Get("/contact", handler.Page)
+
+	// Wildcard route.
+	rt.Get("/:page", handler.Page)
+
+	// Limited wildcard.
+	rt.Get("/:page[about,contact]", handler.Page)
+
+	// Combination of all three.
+	rt.Get("/:section[user,item]/:id/summary", handler.Summary)
+
+Middleware can be placed between routes:
+
+	rt.Get("/static/:file", handler.Static)
+
+	rt.Use(func(w http.ResponseWriter, r *router.Request) {
+		u, err := database.User(r.Request.Cookie)
+		if err != nil {
+			// handle
+		}
+		r.User = u
+	})
+
+	// Response may change depending on whether or not
+	// a user account was attached to the request.
+	rt.Get("/home", handler.Page)
+
+Routes can be grouped and use guards that allow skipping over groups of
+routes entirely without acknowledging they exist or more transparently
+acknowledging them but denying access.
+
+	rt.Get("/home", handler.Page)
+
+	// This call to rt.Group supplies a function whose response
+	// determines whether the request is authorized to access
+	// the group. If the pattern matches but access is denied the
+	// Error function supplied to Router by its Options will be
+	// called with the Request struct's Status field set to
+	// http.StatusUnauthorized.
+	acc := rt.Group("/account", nil, func(r *router.Request) bool {
+		return r.User == nil
+	})
+	acc.Get("/", handler.Account)
+	acc.Get("/messages", handler.Messages)
+*/
 package router
 
 import (
@@ -24,20 +80,6 @@ type Request = struct {
 
 type Options = struct {
 	/*
-		Before is called before the matching route's handler
-		if the request was not redirected. If there is no
-		matching route or it cannot be accessed Before will
-		not be called.
-
-		If Before sets the Status field of *Request to a 300
-		code the request will be terminated at the conclusion
-		of Before. It is the responsibility of the code within
-		Before to actually do the redirect. It is valid for this
-		field to be nil.
-	*/
-	Before Handler
-
-	/*
 		Error is called if the router encounters an error
 		while handling requests. The *Request supplied to
 		this Handler will have its Error and Status fields
@@ -51,7 +93,7 @@ type Options = struct {
 
 	/*
 		Recover will be called in the event of a panic. The
-		supplied *Request will count the error in its Error
+		supplied *Request will contain the error in its Error
 		field. Recover is called immediatley before Deferred,
 		if the latter is present.
 	*/
@@ -63,22 +105,14 @@ type Options = struct {
 		to calculate the rough time the request has taken.
 	*/
 	Deferred Handler
-
-	/*
-		The *Request struct supplied to Handler will have its
-		Id field populated by IdGenerator. Id will be an empty
-		string for every request if IdGenerator is not supplied.
-	*/
-	IdGenerator func() (id string)
 }
 
 type Router struct {
 	route
-	opt       Options
-	reqId     uint64
-	reqIdMu   sync.Mutex
-	seenRoute map[string]struct{}
-	Errors    []error
+	opt     Options
+	reqId   uint64
+	reqIdMu sync.Mutex
+	Errors  []error
 }
 
 /*
@@ -92,10 +126,15 @@ func New(o Options) *Router {
 	rt := &Router{}
 	rt.opt = o
 	rt.route.rt = rt
-	if rt.opt.IdGenerator == nil {
-		rt.opt.IdGenerator = defaultIdGen(rt)
-	}
 	return rt
+}
+
+func (rt *Router) idGen() string {
+	rt.reqIdMu.Lock()
+	rt.reqId++
+	n := rt.reqId
+	rt.reqIdMu.Unlock()
+	return strconv.FormatUint(n, 36)
 }
 
 type route struct {
@@ -121,10 +160,16 @@ without affecting matches. Since it is supplied a pointer
 to Request, one use for this method could be to attach
 a user object to the User field of *Request.
 
-If an error is encountered during the call to handler the
-error must be assigned to the supplied *Request object's
-Error field and the appropriate HTTP status code to its
-Status field.
+If the handler sets the Status field of *Request to a 3xx
+code the request will be terminated at the conclusion of
+handler. It is the responsibility of the code within the
+handler to actually do the redirect.
+
+If the handler sets the Status field to an error code (4xx
+or 5xx) the request will be prematurely terminated. It is
+the responsibility of the handler to respond to the request.
+The error must be assigned to the supplied *Request object's
+Error field
 */
 func (r *route) Use(handler Handler) {
 	rt := r.rt
@@ -165,30 +210,48 @@ func (r *route) Group(pattern string, skip, unauthorized Guard) *route {
 	r.route = append(r.route, group)
 	return &r.route[len(r.route)-1]
 }
+
+// HEAD
 func (r *route) Hed(pattern string, handler Handler) {
 	r.add("HEAD", pattern, handler)
 }
+
+// TRACE
 func (r *route) Trc(pattern string, handler Handler) {
 	r.add("TRACE", pattern, handler)
 }
+
+// CONNECT
 func (r *route) Con(pattern string, handler Handler) {
 	r.add("CONNECT", pattern, handler)
 }
+
+// OPTIONS
 func (r *route) Opt(pattern string, handler Handler) {
 	r.add("OPTIONS", pattern, handler)
 }
+
+// GET
 func (r *route) Get(pattern string, handler Handler) {
 	r.add("GET", pattern, handler)
 }
+
+// POST
 func (r *route) Pst(pattern string, handler Handler) {
 	r.add("POST", pattern, handler)
 }
+
+// PUT
 func (r *route) Put(pattern string, handler Handler) {
 	r.add("PUT", pattern, handler)
 }
+
+// PATCH
 func (r *route) Pat(pattern string, handler Handler) {
 	r.add("PATCH", pattern, handler)
 }
+
+// DELETE
 func (r *route) Del(pattern string, handler Handler) {
 	r.add("DELETE", pattern, handler)
 }
@@ -204,7 +267,7 @@ func (r *route) add(method, pattern string, handler Handler) {
 		))
 	}
 
-	if _, ok := rt.seenRoute[method+pattern]; ok {
+	if seenRoute(r.route, method, rt.expandPattern(pattern)) {
 		rt.Errors = append(rt.Errors, fmt.Errorf(
 			"unreachable route due to duplicate method and pattern: %s %s",
 			method,
@@ -220,20 +283,10 @@ func (r *route) add(method, pattern string, handler Handler) {
 	})
 }
 
-func defaultIdGen(rt *Router) func() string {
-	return func() string {
-		rt.reqIdMu.Lock()
-		rt.reqId++
-		n := rt.reqId
-		rt.reqIdMu.Unlock()
-		return strconv.FormatUint(n, 36)
-	}
-}
-
 func (rt *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 
 	r := &Request{
-		Id:      rt.opt.IdGenerator(),
+		Id:      rt.idGen(),
 		Request: request,
 		Vars:    make(Vars),
 		Began:   time.Now(),
@@ -244,9 +297,8 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 
 	/*
-		This is after the call to rt.Deferred call because they're
-		executed in reverse order. We need to call w.WriteHeader
-		before calling log.End. The call to log.BadRequest in
+		This is after the call to rt.Deferred call because
+		deferred calls are executed in reverse order.
 	*/
 	if rt.opt.Recover != nil {
 		defer func() {
@@ -257,19 +309,18 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		}()
 	}
 
-	if rt.opt.Before != nil {
-		rt.opt.Before(w, r)
-		if r.Status >= 300 && r.Status < 400 {
-			return
-		}
-	}
-
 	reqPath := explodePath(request.URL.Path)
-	code, match := iterateRoutes(w, r, rt.route.route, reqPath, false)
+	code, terminate, match := iterateRoutes(w, r, rt.route.route, reqPath, false)
+	if terminate {
+		return
+	}
+	if rt.opt.Error == nil {
+		return
+	}
 	if !match {
 		code = 404
 	}
-	if code >= 400 && rt.opt.Error != nil {
+	if code >= 400 {
 		if r.Vars == nil {
 			r.Vars = make(Vars)
 		}
@@ -291,13 +342,17 @@ func iterateRoutes(
 	unauthorized bool,
 ) (
 	code int,
+	terminate bool,
 	match bool,
 ) {
 	for _, route := range routes {
 		if route.use != nil {
 			route.use(w, r)
 			if r.Error != nil {
-				return r.Status, true
+				return r.Status, true, false
+			}
+			if r.Status >= 300 && r.Status < 600 {
+				return r.Status, true, false
 			}
 			continue
 		}
@@ -323,19 +378,76 @@ func iterateRoutes(
 		}
 		if len(remainingPath) == 0 {
 			if unauthorized {
-				return http.StatusUnauthorized, true
+				return http.StatusUnauthorized, false, true
 			}
 			route.handler(w, r)
-			return 0, true
+			return 0, false, true
 		}
 		if len(route.route) > 0 {
-			c, m := iterateRoutes(w, r, route.route, remainingPath, unauthorized)
-			if m {
-				return c, m
+			c, t, m := iterateRoutes(w, r, route.route, remainingPath, unauthorized)
+			if t || m {
+				return c, t, m
 			}
 		}
 	}
-	return 0, false
+	return 0, false, false
+}
+
+func seenRoute(routes []route, method string, pattern []segment) bool {
+	for _, route := range routes {
+		if route.use != nil {
+			continue
+		}
+		if route.method != "" && route.method != method {
+			continue
+		}
+		if len(route.pattern) > len(pattern) {
+			continue
+		}
+		remainingPattern := pattern[len(route.pattern):]
+		ok := routesMatchExactly(route.pattern, pattern[:len(route.pattern)])
+		if !ok {
+			continue
+		}
+		if len(remainingPattern) == 0 {
+			return true
+		}
+		if len(route.route) > 0 {
+			if seenRoute(route.route, method, remainingPattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func routesMatchExactly(existing, proposed []segment) bool {
+	if len(existing) != len(proposed) {
+		return false
+	}
+	for i, eSeg := range existing {
+		pSeg := proposed[i]
+		if eSeg.matches == nil || pSeg.matches == nil {
+			return false
+		}
+		if !sameElems(eSeg.matches, pSeg.matches) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameElems(ss1, ss2 []string) bool {
+	seen := make(map[string]bool)
+	for _, s1 := range ss1 {
+		seen[s1] = true
+	}
+	for _, s2 := range ss2 {
+		if !seen[s2] {
+			return false
+		}
+	}
+	return true
 }
 
 func pathsMatch(pattern []segment, reqPath []string) (vars Vars, ok bool) {
